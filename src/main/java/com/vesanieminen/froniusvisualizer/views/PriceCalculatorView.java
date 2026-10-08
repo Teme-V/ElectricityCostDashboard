@@ -47,9 +47,11 @@ import com.vaadin.flow.router.Route;
 import com.vaadin.flow.router.RouteAlias;
 import com.vaadin.flow.server.StreamResource;
 import com.vaadin.flow.theme.lumo.LumoUtility;
+import com.vesanieminen.froniusvisualizer.components.BatterySimulationSection;
 import com.vesanieminen.froniusvisualizer.components.DoubleLabel;
 import com.vesanieminen.froniusvisualizer.components.MaterialIcon;
 import com.vesanieminen.froniusvisualizer.components.SettingsDialog;
+import com.vesanieminen.froniusvisualizer.services.BatterySimulationService;
 import com.vesanieminen.froniusvisualizer.services.PriceCalculatorService;
 import com.vesanieminen.froniusvisualizer.services.PriceCalculatorService.FingridUsageData;
 import lombok.Getter;
@@ -145,6 +147,7 @@ public class PriceCalculatorView extends Main {
     private final SuperDoubleField seasonalTransferMonthlyPriceField;
     private final ComboBox<NordpoolspotView.VAT> vatComboBox;
     private final ComboBox<SettingsDialog.PriceResolution> priceResolutionComboBox;
+    private final BatterySimulationSection batterySection;
 
     private MemoryBuffer lastConsumptionData;
     private MemoryBuffer lastProductionData;
@@ -477,6 +480,11 @@ public class PriceCalculatorView extends Main {
         baasDiv.addClassNames(LumoUtility.Display.FLEX, LumoUtility.Gap.Column.MEDIUM, LumoUtility.FlexWrap.WRAP);
         content.add(baasDiv);
 
+        // battery simulation
+        batterySection = new BatterySimulationSection();
+        batterySection.setVisible(false);
+        content.add(batterySection);
+
         readFieldValues();
 
         calculationsCheckboxGroup.addValueChangeListener(e -> {
@@ -490,13 +498,15 @@ public class PriceCalculatorView extends Main {
             nightTransferDiv.setEnabled(e.getValue().contains(Calculations.NIGHT_TRANSFER));
             seasonalTransferDiv.setVisible(e.getValue().contains(Calculations.SEASONAL_TRANSFER));
             seasonalTransferDiv.setEnabled(e.getValue().contains(Calculations.SEASONAL_TRANSFER));
-            productionUpload.setVisible(e.getValue().contains(Calculations.SPOT_PRODUCTION));
+            productionUpload.setVisible(e.getValue().contains(Calculations.SPOT_PRODUCTION) || e.getValue().contains(Calculations.BATTERY));
             taxClassSelect.setVisible(e.getValue().contains(Calculations.TAXES));
             taxClassSelect.setEnabled(e.getValue().contains(Calculations.TAXES));
             lockedPriceField.setVisible(e.getValue().contains(Calculations.LOCKED_PRICE));
             lockedPriceField.setEnabled(e.getValue().contains(Calculations.LOCKED_PRICE));
             baasDiv.setVisible(e.getValue().contains(Calculations.BATTERY_AS_A_SERVICE));
             baasDiv.setEnabled(e.getValue().contains(Calculations.BATTERY_AS_A_SERVICE));
+            batterySection.setVisible(e.getValue().contains(Calculations.BATTERY));
+            batterySection.setTransferProducts(selectedTransferProducts(e.getValue()));
             updateCalculateButtonState();
             saveCheckboxGroupValues();
         });
@@ -848,6 +858,17 @@ public class PriceCalculatorView extends Main {
                     final var spotProductionCalculation = calculateSpotElectricityPriceDetails(productionData.data(), -spotProductionMarginField.getValue(), false, fromDateTimePicker.getValue().atZone(fiZoneID).toInstant(), toDateTimePicker.getValue().atZone(fiZoneID).toInstant(), isQuarterlyPriceResolutionEnabled());
                     // Create spot production chart
                     chartLayout.add(createChart(spotProductionCalculation, false, getTranslation("Production / value per hour"), "Production", "Production value"));
+                }
+
+                if (isCalculatingBattery()) {
+                    final var productionData = lastProductionData == null ? null
+                            : getFingridUsageData(lastProductionData.getInputStream(), isQuarterlyPriceResolutionEnabled()).data();
+                    final var batteryInput = BatterySimulationService.buildInput(consumptionData.data(), productionData,
+                            createBatteryTariff(), fromDateTimePicker.getValue().atZone(fiZoneID).toInstant(),
+                            toDateTimePicker.getValue().atZone(fiZoneID).toInstant());
+                    final Div batteryResultDiv = addSection(resultLayout, getTranslation("calculator.battery"));
+                    batteryResultDiv.add(batterySection.getResultsComponent());
+                    batterySection.simulate(batteryInput);
                 }
 
             } catch (IOException | ParseException | CsvValidationException ex) {
@@ -1286,6 +1307,36 @@ public class PriceCalculatorView extends Main {
         return calculationsCheckboxGroup.getValue().contains(Calculations.BATTERY_AS_A_SERVICE);
     }
 
+    private boolean isCalculatingBattery() {
+        return calculationsCheckboxGroup.getValue().contains(Calculations.BATTERY);
+    }
+
+    private static List<BatterySimulationService.TransferProduct> selectedTransferProducts(Set<Calculations> calculations) {
+        final var products = new ArrayList<BatterySimulationService.TransferProduct>();
+        if (calculations.contains(Calculations.GENERAL_TRANSFER)) {
+            products.add(BatterySimulationService.TransferProduct.GENERAL);
+        }
+        if (calculations.contains(Calculations.NIGHT_TRANSFER)) {
+            products.add(BatterySimulationService.TransferProduct.NIGHT);
+        }
+        if (calculations.contains(Calculations.SEASONAL_TRANSFER)) {
+            products.add(BatterySimulationService.TransferProduct.SEASONAL);
+        }
+        return products;
+    }
+
+    private BatterySimulationService.Tariff createBatteryTariff() {
+        return new BatterySimulationService.Tariff(spotMarginField.getValue(), isVATEnabled(), isQuarterlyPriceResolutionEnabled(),
+                batterySection.getTransferProduct(), valueOrZero(generalTransferField), valueOrZero(nightTransferDayPriceField),
+                valueOrZero(nightTransferNightPriceField), valueOrZero(seasonalTransferWinterPriceField),
+                valueOrZero(seasonalTransferOtherPriceField), isCalculatingTax(), taxClassSelect.getValue().getTaxPrice(),
+                batterySection.getSaleMargin());
+    }
+
+    private static double valueOrZero(SuperDoubleField field) {
+        return field.getValue() == null ? 0 : field.getValue();
+    }
+
     private void addConsumptionSucceededListener(MemoryBuffer fileBuffer, Upload consumptionUpload) {
         consumptionUpload.addSucceededListener(event -> {
             lastConsumptionData = fileBuffer;
@@ -1594,7 +1645,8 @@ public class PriceCalculatorView extends Main {
         SEASONAL_TRANSFER("calculator.seasonal-transfer.title"),
         TAXES("calculator.taxes"),
         SPOT_PRODUCTION("Spot production price"),
-        BATTERY_AS_A_SERVICE("calculator.baas");
+        BATTERY_AS_A_SERVICE("calculator.baas"),
+        BATTERY("calculator.battery");
 
         private final String name;
 
